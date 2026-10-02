@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+find_no_website.py - find businesses WITHOUT a website, anywhere in the world.
+
+Data source: OpenStreetMap (Overpass API + Nominatim geocoder). Free, no API key.
+No third-party packages needed (Python 3.8+).
+
+Examples:
+  python find_no_website.py "Accra, Ghana"
+  python find_no_website.py "Kumasi, Ghana" "Lagos, Nigeria" -c restaurant salon hotel
+  python find_no_website.py "Nairobi, Kenya" -c all --require-contact -o nairobi.csv
+  python find_no_website.py --list-categories
+"""
+import argparse
+import csv
+import json
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+USER_AGENT = "no-website-finder/1.0 (personal lead research)"
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+
+# friendly name -> list of (osm_key, osm_value). Add your own here.
+CATEGORIES = {
+    "restaurant": [("amenity", "restaurant")],
+    "cafe": [("amenity", "cafe")],
+    "bar": [("amenity", "bar"), ("amenity", "pub")],
+    "fast_food": [("amenity", "fast_food")],
+    "hotel": [("tourism", "hotel"), ("tourism", "guest_house"), ("tourism", "hostel")],
+    "salon": [("shop", "hairdresser"), ("shop", "beauty")],
+    "barber": [("shop", "barber")],
+    "clothing": [("shop", "clothes"), ("shop", "boutique"), ("shop", "tailor")],
+    "supermarket": [("shop", "supermarket"), ("shop", "convenience")],
+    "electronics": [("shop", "electronics"), ("shop", "mobile_phone"), ("shop", "computer")],
+    "car_repair": [("shop", "car_repair"), ("shop", "car"), ("shop", "tyres")],
+    "pharmacy": [("amenity", "pharmacy")],
+    "clinic": [("amenity", "clinic"), ("amenity", "dentist"), ("amenity", "doctors")],
+    "school": [("amenity", "school"), ("amenity", "kindergarten"), ("amenity", "college")],
+    "gym": [("leisure", "fitness_centre")],
+    "bakery": [("shop", "bakery")],
+    "building_materials": [("shop", "hardware"), ("shop", "doityourself"), ("shop", "building_materials")],
+    "furniture": [("shop", "furniture"), ("shop", "interior_decoration")],
+    "bank_finance": [("amenity", "bank"), ("office", "financial")],
+    "office": [("office", "company"), ("office", "estate_agent"), ("office", "lawyer"),
+               ("office", "accountant"), ("office", "insurance")],
+    "craft": [("craft", "carpenter"), ("craft", "electrician"), ("craft", "plumber"),
+              ("craft", "caterer"), ("craft", "photographer")],
+}
+CATEGORIES["all"] = [kv for v in CATEGORIES.values() for kv in v]
+
+# tags that mean "has a website"
+WEBSITE_TAGS = ["website", "contact:website", "url", "contact:url", "operator:website"]
+
+
+def http(url, data=None, timeout=200):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def geocode(place):
+    """Return Overpass area id for a place name (city, region or country)."""
+    q = urllib.parse.urlencode({"q": place, "format": "json", "limit": 5})
+    results = http(f"{NOMINATIM}?{q}")
+    time.sleep(1.1)  # Nominatim usage policy: max 1 req/sec
+    for r in results:
+        if r.get("osm_type") == "relation":
+            return 3600000000 + int(r["osm_id"]), r.get("display_name", place)
+        if r.get("osm_type") == "way":
+            return 2400000000 + int(r["osm_id"]), r.get("display_name", place)
+    return None, None
+
+
+def build_query(area_id, filters):
+    no_site = "".join(f'[!"{t}"]' for t in WEBSITE_TAGS)
+    parts = "\n".join(
+        f'  nwr["{k}"="{v}"]["name"]{no_site}(area.a);' for k, v in filters
+    )
+    return f"[out:json][timeout:180];\narea(id:{area_id})->.a;\n(\n{parts}\n);\nout center tags;"
+
+
+def run_overpass(query):
+    last_err = None
+    for url in OVERPASS_URLS:
+        for attempt in range(2):
+            try:
+                body = urllib.parse.urlencode({"data": query}).encode()
+                return http(url, data=body)
+            except Exception as e:  # rate limit / timeout -> retry / next mirror
+                last_err = e
+                time.sleep(5)
+    raise RuntimeError(f"Overpass failed: {last_err}")
+
+
+def address(t):
+    bits = [t.get("addr:housenumber"), t.get("addr:street"), t.get("addr:suburb"),
+            t.get("addr:city") or t.get("addr:town")]
+    return ", ".join(b for b in bits if b)
+
+
+def category_of(t):
+    for k in ("amenity", "shop", "tourism", "office", "craft", "leisure"):
+        if k in t:
+            return f"{k}={t[k]}"
+    return ""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Find businesses without websites.")
+    ap.add_argument("locations", nargs="*", help='e.g. "Accra, Ghana" "Lagos, Nigeria"')
+    ap.add_argument("-c", "--categories", nargs="+", default=["all"],
+                    help="category names (see --list-categories) or raw key=value tags")
+    ap.add_argument("-o", "--out", default="leads_no_website.csv")
+    ap.add_argument("--require-contact", action="store_true",
+                    help="only keep businesses that have a phone or email listed")
+    ap.add_argument("--list-categories", action="store_true")
+    args = ap.parse_args()
+
+    if args.list_categories:
+        print("\n".join(sorted(CATEGORIES)))
+        return
+    if not args.locations:
+        ap.error("give at least one location")
+
+    filters = []
+    for c in args.categories:
+        if c in CATEGORIES:
+            filters += CATEGORIES[c]
+        elif "=" in c:
+            k, v = c.split("=", 1)
+            filters.append((k, v))
+        else:
+            sys.exit(f"Unknown category '{c}'. Use --list-categories.")
+    filters = list(dict.fromkeys(filters))
+
+    rows, seen = [], set()
+    for loc in args.locations:
+        print(f"\n>> {loc}")
+        area_id, full = geocode(loc)
+        if not area_id:
+            print("   could not find that place, skipping")
+            continue
+        print(f"   matched: {full}")
+        data = run_overpass(build_query(area_id, filters))
+        for el in data.get("elements", []):
+            key = (el["type"], el["id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            t = el.get("tags", {})
+            phone = t.get("phone") or t.get("contact:phone") or t.get("contact:mobile") or ""
+            email = t.get("email") or t.get("contact:email") or ""
+            if args.require_contact and not (phone or email):
+                continue
+            lat = el.get("lat") or el.get("center", {}).get("lat")
+            lon = el.get("lon") or el.get("center", {}).get("lon")
+            rows.append({
+                "search_location": loc,
+                "name": t.get("name", ""),
+                "category": category_of(t),
+                "phone": phone,
+                "email": email,
+                "address": address(t),
+                "facebook": t.get("contact:facebook", ""),
+                "instagram": t.get("contact:instagram", ""),
+                "lat": lat, "lon": lon,
+                "osm_url": f"https://www.openstreetmap.org/{el['type']}/{el['id']}",
+                "google_maps_check": f"https://www.google.com/maps/search/?api=1&query={lat},{lon}" if lat else "",
+            })
+        print(f"   {len(rows)} total leads so far")
+        time.sleep(2)
+
+    if not rows:
+        print("\nNo results. Try a broader place or different categories.")
+        return
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nSaved {len(rows)} businesses to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
